@@ -1,0 +1,51 @@
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import Protocol
+
+
+@dataclass(frozen=True)
+class ImageConditioning:
+    artifact_path: str
+    frame_index: int
+    strength: float
+    crf: int = 0
+
+
+@dataclass(frozen=True)
+class LtxGenerationRequest:
+    pipeline: str
+    prompt: str
+    negative_prompt: str | None
+    seed: int
+    width: int
+    height: int
+    num_frames: int
+    frame_rate: float
+    images: tuple[ImageConditioning, ...] = ()
+    enhance_prompt: bool = False
+    include_audio: bool = True
+    num_inference_steps: int | None = None
+
+
+@dataclass(frozen=True)
+class LtxGenerationResult:
+    video_chunks: Iterator[object]
+    audio: object | None
+    effective_parameters: dict[str, object]
+
+
+ProgressObserver = Callable[[str, int | None, dict[str, object]], None]
+CancellationCheck = Callable[[], bool]
+
+
+class LtxEngine(Protocol):
+    def capabilities(self) -> dict[str, object]: ...
+
+    def generate(
+        self,
+        request: LtxGenerationRequest,
+        observer: ProgressObserver,
+        is_cancel_requested: CancellationCheck,
+    ) -> LtxGenerationResult: ...
+
+    def close(self) -> None: ...

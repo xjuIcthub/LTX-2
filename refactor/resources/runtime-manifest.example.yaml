@@ -1,0 +1,29 @@
+schemaVersion: icthub.ltx-runtime/v1
+ltx:
+  gitCommit: REPLACE_WITH_FULL_COMMIT
+  pipeline: distilled
+models:
+  checkpoint:
+    path: /data/models/ltx/checkpoint.safetensors
+    sha256: REPLACE
+  spatialUpsampler:
+    path: /data/models/ltx/spatial-upscaler.safetensors
+    sha256: REPLACE
+  gemma:
+    root: /data/models/gemma
+    revision: REPLACE
+  loras: []
+runtime:
+  quantization: fp8-cast
+  offload: none
+  dtype: bfloat16
+  attentionBackend: sdpa
+  compileMode: disabled
+  python: "3.12"
+  pytorch: REPLACE
+  cuda: REPLACE
+  driver: REPLACE
+policy:
+  version: icthub-ltx-v1
+  workerUser: icthub-gpu
+  allowRoot: false
