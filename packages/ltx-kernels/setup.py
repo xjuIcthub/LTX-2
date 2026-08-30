@@ -126,17 +126,44 @@ if __name__ == "__main__":
     ext_modules = []
 
     # all2all_cpp -- unchanged.
-    all2all_args = ["-O3", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter", "-Wno-attributes"]
+    all2all_args = [
+        "-O3",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unused-parameter",
+        "-Wno-attributes",
+        # GCC 13 diagnoses references inside PyTorch 2.5's IListRef headers.
+        # They are outside this extension and were fixed in later PyTorch releases.
+        "-Wno-dangling-reference",
+    ]
+    all2all_nvcc_args = [
+        "-O3",
+        "--expt-relaxed-constexpr",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    ]
     ext_modules.append(
         CUDAExtension(
             name="all2all_cpp",
-            include_dirs=[str(ROOT / "csrc/all2all"), str(ROOT / "csrc/include"), *_nvidia_include_dirs()],
+            # Keep the selected CUDA toolkit ahead of pip-provided CUDA headers.
+            # Mixing CUDA 12.8's cuda/std with torch-cu121's cuda_fp16 headers
+            # produces invalid host/device overloads during nvcc compilation.
+            include_dirs=[
+                f"{CUDA_HOME}/include",
+                f"{CUDA_HOME}/include/cccl",
+                str(ROOT / "csrc/all2all"),
+                str(ROOT / "csrc/include"),
+                *_nvidia_include_dirs(),
+            ],
             sources=[
                 "csrc/all2all/all2all.cpp",
                 "csrc/all2all/cuda/all2all_heads.cu",
                 "csrc/all2all/cuda/allgather.cu",
             ],
-            extra_compile_args={"cxx": all2all_args, "nvcc": ["-O3"]},
+            extra_compile_args={"cxx": all2all_args, "nvcc": all2all_nvcc_args},
         )
     )
 
@@ -154,7 +181,12 @@ if __name__ == "__main__":
                 "csrc/ops/rms_norm_split_rope.cpp",
                 "csrc/ops/rms_norm_split_rope_cuda.cu",
             ],
-            include_dirs=[str(ROOT / "csrc/ops/include"), *_nvidia_include_dirs()],
+            include_dirs=[
+                f"{CUDA_HOME}/include",
+                f"{CUDA_HOME}/include/cccl",
+                str(ROOT / "csrc/ops/include"),
+                *_nvidia_include_dirs(),
+            ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [
