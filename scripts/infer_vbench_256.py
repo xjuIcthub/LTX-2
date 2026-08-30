@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
@@ -24,6 +25,77 @@ from ltx_pipelines.utils.types import OffloadMode
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_NAME = Path(__file__).name
+_NOT_LOADED = object()
+
+
+class _CachedBuilder:
+    """Keep the first model built by an LTX builder resident for later prompts."""
+
+    def __init__(self, builder: object, label: str) -> None:
+        self._builder = builder
+        self._label = label
+        self._model: object = _NOT_LOADED
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._builder, name)
+
+    def build(self, *args: object, **kwargs: object) -> object:
+        if self._model is _NOT_LOADED:
+            logging.info("Loading persistent %s", self._label)
+            build = self._builder.build  # type: ignore[attr-defined]
+            self._model = build(*args, **kwargs)
+        return self._model
+
+
+def _cached_factory(factory: Callable[..., object], label: str) -> Callable[..., object]:
+    model: object = _NOT_LOADED
+
+    def build_once(*args: object, **kwargs: object) -> object:
+        nonlocal model
+        if model is _NOT_LOADED:
+            logging.info("Loading persistent %s", label)
+            model = factory(*args, **kwargs)
+        return model
+
+    return build_once
+
+
+def enable_persistent_weights(pipeline: TI2VidTwoStagesHQPipeline) -> None:
+    """Cache every model used by this text-only, video-only batch on the H200."""
+    pipeline.prompt_encoder._build_text_encoder = _cached_factory(  # type: ignore[method-assign]
+        pipeline.prompt_encoder._build_text_encoder,
+        "Gemma text encoder",
+    )
+    pipeline.prompt_encoder._build_embeddings_processor = _cached_factory(  # type: ignore[method-assign]
+        pipeline.prompt_encoder._build_embeddings_processor,
+        "embeddings processor",
+    )
+    pipeline.stage_1._build_transformer = _cached_factory(  # type: ignore[method-assign]
+        pipeline.stage_1._build_transformer,
+        "stage-1 transformer",
+    )
+    pipeline.stage_2._build_transformer = _cached_factory(  # type: ignore[method-assign]
+        pipeline.stage_2._build_transformer,
+        "stage-2 transformer",
+    )
+    pipeline.upsampler._encoder_builder = _CachedBuilder(
+        pipeline.upsampler._encoder_builder,
+        "upsampler video encoder",
+    )
+    pipeline.upsampler._upsampler_builder = _CachedBuilder(
+        pipeline.upsampler._upsampler_builder,
+        "spatial upsampler",
+    )
+    pipeline.video_decoder._decoder_builder = _CachedBuilder(
+        pipeline.video_decoder._decoder_builder,
+        "video decoder",
+    )
+
+    # This batch is text-to-video only, so image conditioning is always empty.
+    # Audio latents still participate in diffusion, but decoding them is unnecessary
+    # because the requested MP4 files contain no audio stream.
+    pipeline.image_conditioner = lambda _fn: []  # type: ignore[assignment]
+    pipeline.audio_decoder = lambda _latent: None  # type: ignore[assignment]
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +136,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=None, help="Exclusive end index; defaults to all prompts.")
     parser.add_argument("--enhance-prompt", action="store_true")
+    parser.add_argument(
+        "--reload-weights-each-video",
+        action="store_true",
+        help="Use the original low-memory behavior instead of keeping model weights resident.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -154,7 +231,8 @@ def build_pipeline(args: argparse.Namespace) -> TI2VidTwoStagesHQPipeline:
     quantization = (
         QuantizationKind(args.quantization).to_policy(checkpoint_path) if args.quantization != "none" else None
     )
-    return TI2VidTwoStagesHQPipeline(
+    persistent_weights = not args.reload_weights_each_video
+    pipeline = TI2VidTwoStagesHQPipeline(
         checkpoint_path=checkpoint_path,
         distilled_lora=distilled_lora,
         distilled_lora_strength_stage_1=args.distilled_lora_strength_stage_1,
@@ -165,8 +243,11 @@ def build_pipeline(args: argparse.Namespace) -> TI2VidTwoStagesHQPipeline:
         quantization=quantization,
         registry=None,
         offload_mode=OffloadMode(args.offload),
-        alloc_trim_strategy=AllocatorTrimStrategy.TRIM,
+        alloc_trim_strategy=AllocatorTrimStrategy.DEFER if persistent_weights else AllocatorTrimStrategy.TRIM,
     )
+    if persistent_weights:
+        enable_persistent_weights(pipeline)
+    return pipeline
 
 
 def main() -> None:
@@ -179,7 +260,8 @@ def main() -> None:
     print(
         f"[{SCRIPT_NAME}] HQ shard={args.shard_index}/{args.num_shards} prompts={len(indices)} "
         f"frames={args.num_frames} size={args.width}x{args.height} fps={args.fps:g} "
-        f"steps={args.num_inference_steps}+3 audio=off",
+        f"steps={args.num_inference_steps}+3 audio=off "
+        f"weights={'reload' if args.reload_weights_each_video else 'persistent'}",
         flush=True,
     )
     if args.dry_run:
@@ -257,6 +339,7 @@ def main() -> None:
                     "height": args.height,
                     "fps": args.fps,
                     "audio": False,
+                    "persistent_weights": not args.reload_weights_each_video,
                     "shard_index": args.shard_index,
                     "num_shards": args.num_shards,
                 },
