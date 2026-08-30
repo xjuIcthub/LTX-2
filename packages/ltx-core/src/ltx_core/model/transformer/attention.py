@@ -1,4 +1,5 @@
 import functools
+import inspect
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,16 +17,27 @@ from ltx_core.model.transformer.ops import (
 from ltx_core.model.transformer.rope import LTXRopeType
 
 
+_SDPA_KERNEL_SUPPORTS_PRIORITY = "set_priority" in inspect.signature(sdpa_kernel).parameters
+
+
 def _torch_default_sdpa_priority() -> list[SDPBackend]:
     """Fetch torch's current default SDPA priority order at runtime.
     Used as the default for ``PytorchAttention`` so the wrapper-always
     code path matches torch's native dispatch order without hard-coding it
     (which would drift if torch updates the default).
-    ``torch._C._get_sdp_priority_order`` is a private API; we accept that
-    risk because the project pins ``torch`` in the lockfile, so any
-    rename/removal surfaces on a controlled torch bump rather than silently.
+    ``torch._C._get_sdp_priority_order`` was added after torch 2.5. On the
+    CUDA 12.1 build, enable every production backend and let torch's native
+    dispatcher select among them.
     """
-    return [SDPBackend(p) for p in torch._C._get_sdp_priority_order()]
+    get_priority_order = getattr(torch._C, "_get_sdp_priority_order", None)
+    if get_priority_order is not None:
+        return [SDPBackend(p) for p in get_priority_order()]
+    return [
+        SDPBackend.CUDNN_ATTENTION,
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
 
 
 flash_attn_interface = None
@@ -66,8 +78,9 @@ class MaskedAttentionCallable(Protocol):
 class PytorchAttention(AttentionCallable):
     def __init__(self, priority: list[SDPBackend] | None = None) -> None:
         # priority=None -> snapshot torch's default SDPA priority at construction.
-        # Always passed through ``sdpa_kernel(..., set_priority=True)`` so the
-        # call site is uniform regardless of how the priority was chosen.
+        # torch 2.6+ can preserve this order explicitly with ``set_priority``;
+        # torch 2.5 accepts the same backend list but only treats it as an
+        # enabled-backend set.
         self._priority = priority if priority is not None else _torch_default_sdpa_priority()
 
     @property
@@ -91,7 +104,12 @@ class PytorchAttention(AttentionCallable):
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
 
-        with sdpa_kernel(self._priority, set_priority=True):
+        sdpa_context = (
+            sdpa_kernel(self._priority, set_priority=True)
+            if _SDPA_KERNEL_SUPPORTS_PRIORITY
+            else sdpa_kernel(self._priority)
+        )
+        with sdpa_context:
             out = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
             )
