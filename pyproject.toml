@@ -37,7 +37,11 @@ dev = [
 # Opt-in compiled CUDA kernels (blockwise FP8/FP6 GEMM + multi-GPU all2all), built
 # editable from packages/ltx-kernels without build isolation (torch must already be
 # installed), CUDA host required. Install with `uv sync --group kernels`.
-kernels = ["ltx-kernels"]
+kernels = [
+    "ltx-kernels",
+    "setuptools>=61",
+    "wheel",
+]
 
 [tool.ruff]
 target-version = "py310"
