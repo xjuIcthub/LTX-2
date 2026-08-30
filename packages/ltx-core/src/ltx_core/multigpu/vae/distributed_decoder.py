@@ -2,8 +2,8 @@
 Tiles are assigned to ranks via round-robin, so the number of tiles
 may exceed the number of GPUs (e.g. 16 tiles on 4 GPUs = 4 tiles per
 rank).  Each rank decodes its assigned tiles sequentially.  Workers
-put their list of decoded tiles into a ``mp.Queue`` (CUDA IPC —
-zero-copy handle sharing).  The driver collects all tiles, blends
+put their list of decoded tiles into a ``mp.Queue`` after moving the pixel
+tensors to CPU.  The driver collects all tiles, blends
 overlap zones, and returns temporal batches distributed across devices.
 The tiling configuration comes from ``MGPUConfig.vae_tiling`` (set at
 construction time), NOT from the pipeline's SGPU tiling kwarg.  MGPU
@@ -153,7 +153,7 @@ class DistributedVideoDecoder(torch.nn.Module):
     """Distributed VAE decoder with queue-based tile collection.
     All ranks decode their latent tile in parallel.  Workers send
     their :class:`DecodedTile` to the driver rank via the shared
-    ``mp.Queue`` (CUDA IPC — zero-copy).  The driver collects all
+    ``mp.Queue`` using CPU tensors.  The driver collects all
     tiles, blends overlapping regions, and returns temporal batches
     as an iterator.
     Parameters
@@ -161,7 +161,7 @@ class DistributedVideoDecoder(torch.nn.Module):
     decoder:
         The real (local) ``VideoDecoder`` instance.
     queue:
-        ``mp.Queue`` shared across all ranks for CUDA IPC tile transfer.
+        ``mp.Queue`` shared across all ranks for CPU tile transfer.
     vae_group:
         NCCL process group for the VAE ranks. Used to derive
         ``rank`` and ``world_size`` within the group.
@@ -233,7 +233,13 @@ class DistributedVideoDecoder(torch.nn.Module):
 
         # Phase 2: workers send tiles to driver.
         if self.rank != self.driver_rank:
-            self.queue.put((self.rank, my_tiles))
+            # CUDA tensor pickling relies on pidfd_getfd/CUDA IPC, which is
+            # blocked by seccomp on many shared GPU servers. The decoded tile
+            # payload is small relative to model weights, and gather_frames
+            # already moves every tile onto the destination device, so a CPU
+            # queue payload is portable without changing the assembled result.
+            cpu_tiles = [DecodedTile(pixels=tile.pixels.cpu(), pixel_tile=tile.pixel_tile) for tile in my_tiles]
+            self.queue.put((self.rank, cpu_tiles))
             return iter([])
 
         # Phase 3: driver collects and assembles.
