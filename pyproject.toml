@@ -2,19 +2,29 @@
 ltx-core = { workspace = true }
 ltx-pipelines = { workspace = true }
 ltx-kernels = { path = "packages/ltx-kernels", editable = true }
+torch = { index = "pytorch-cu121" }
+torchaudio = { index = "pytorch-cu121" }
 
 [tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 no-build-isolation-package = ["ltx-kernels"]
 
 [tool.uv.workspace]
-members = ["packages/*"]
-# ltx-kernels compiles CUDA extensions; keep it out of the workspace so a plain
-# `uv sync` never forces a CUDA toolchain. Opt in via the `kernels` group below.
-exclude = ["packages/ltx-kernels"]
+# The H200 deployment is inference-only. Keeping the trainer out of the default
+# workspace avoids its torchcodec ABI pin, which targets newer PyTorch/CUDA
+# releases than the required CUDA 12.1 stack.
+members = ["packages/ltx-core", "packages/ltx-pipelines"]
 
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
 
 [dependency-groups]
 dev = [
@@ -30,7 +40,7 @@ dev = [
 kernels = ["ltx-kernels"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 120
 exclude = [
     # Vendored kernel sources, excluded from our lint/format rules.
