@@ -9,6 +9,7 @@ model_dir="${MODEL_DIR:-models/ltx-2.3}"
 gemma_dir="${GEMMA_DIR:-models/gemma-3-12b}"
 output_path="${OUTPUT_PATH:-outputs/ltx-2.3-smoke.mp4}"
 prompt="${PROMPT:-A red fox walks through a snowy pine forest while soft wind moves the branches. The camera slowly tracks alongside the fox. Natural forest ambience and quiet footsteps are audible.}"
+offload_mode="${OFFLOAD_MODE:-cpu}"
 
 mkdir -p "$(dirname "$output_path")"
 
@@ -26,6 +27,7 @@ if [[ -f "$distilled_checkpoint" ]]; then
     --width 768 \
     --num-frames 49 \
     --frame-rate 24 \
+    --offload "$offload_mode" \
     --seed 42 \
     --output-path "$output_path" \
     --prompt "$prompt"
@@ -40,6 +42,7 @@ else
     --num-frames 49 \
     --frame-rate 24 \
     --num-inference-steps 8 \
+    --offload "$offload_mode" \
     --seed 42 \
     --output-path "$output_path" \
     --prompt "$prompt"
