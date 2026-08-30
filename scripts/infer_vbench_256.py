@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+# ruff: noqa: T201 -- this long-running CLI must stream human-readable progress.
 import argparse
 import csv
+import fcntl
 import json
 import logging
 import os
 import time
-from datetime import timedelta
 from pathlib import Path
+from typing import TextIO
 
 import torch
 
-from ltx_pipelines.multigpu.controller import MGPUController
-from ltx_pipelines.ti2vid_two_stages_mgpu import TI2VidTwoStagesRunner
-from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, LTX_2_3_PARAMS
-
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
+from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, LTX_2_3_HQ_PARAMS
+from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.quantization_factory import QuantizationKind
+from ltx_pipelines.utils.types import OffloadMode
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_NAME = Path(__file__).name
@@ -22,7 +28,7 @@ SCRIPT_NAME = Path(__file__).name
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run all 256 VBench prompts with the persistent two-GPU LTX-2 pipeline."
+        description="Run a sharded 256-prompt VBench batch with the official LTX-2.3 HQ pipeline."
     )
     parser.add_argument("--prompts-csv", type=Path, default=REPO_ROOT / "VBench-origin_256_prompts.csv")
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "outputs" / "vbench_origin_256")
@@ -42,14 +48,22 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT / "models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
     )
     parser.add_argument("--gemma-root", type=Path, default=REPO_ROOT / "models/gemma-3-12b")
-    parser.add_argument("--height", type=int, default=256)
-    parser.add_argument("--width", type=int, default=448)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=768)
     parser.add_argument("--num-frames", type=int, default=121)
     parser.add_argument("--fps", type=float, default=24.0)
-    parser.add_argument("--num-inference-steps", type=int, default=8)
+    parser.add_argument("--num-inference-steps", type=int, default=15)
     parser.add_argument("--seed-base", type=int, default=42)
+    parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
+    parser.add_argument("--quantization", choices=("fp8-cast", "none"), default="fp8-cast")
+    parser.add_argument("--offload", choices=("none", "cpu"), default="none")
+    parser.add_argument("--distilled-lora-strength-stage-1", type=float, default=0.25)
+    parser.add_argument("--distilled-lora-strength-stage-2", type=float, default=0.5)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=None, help="Exclusive end index; defaults to all prompts.")
+    parser.add_argument("--enhance-prompt", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -79,59 +93,117 @@ def append_manifest(path: Path, payload: dict[str, object]) -> None:
         os.fsync(handle.fileno())
 
 
-def validate_args(args: argparse.Namespace, row_count: int) -> tuple[int, int]:
-    if torch.cuda.device_count() != 2 and not args.dry_run:
-        raise RuntimeError(
-            f"Expected exactly two visible GPUs, found {torch.cuda.device_count()}. "
-            "Launch with CUDA_VISIBLE_DEVICES=0,1."
-        )
-    if args.height % 64 or args.width % 64:
-        raise ValueError("The two-stage LTX pipeline requires height and width divisible by 64")
-    if (args.num_frames - 1) % 8:
-        raise ValueError("LTX num_frames must satisfy num_frames = 8 * k + 1")
+def selected_indices(args: argparse.Namespace, row_count: int) -> list[int]:
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard-index < num-shards")
     start = max(0, args.start_index)
     end = row_count if args.end_index is None else min(row_count, args.end_index)
     if start >= end:
         raise ValueError(f"Empty index range [{start}, {end})")
+    indices = [index for index in range(start, end) if index % args.num_shards == args.shard_index]
+    if not indices:
+        raise ValueError(f"Shard {args.shard_index}/{args.num_shards} has no indices in [{start}, {end})")
+    return indices
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if torch.cuda.device_count() != 1 and not args.dry_run:
+        raise RuntimeError(
+            f"Expected exactly one visible GPU per HQ shard, found {torch.cuda.device_count()}. "
+            "Launch one process per GPU."
+        )
+    if args.height % 64 or args.width % 64:
+        raise ValueError("LTX dimensions must be divisible by 64")
+    if (args.num_frames - 1) % 8:
+        raise ValueError("LTX num_frames must satisfy num_frames = 8 * k + 1")
+    if args.num_inference_steps < 1:
+        raise ValueError("--num-inference-steps must be positive")
+    for strength in (args.distilled_lora_strength_stage_1, args.distilled_lora_strength_stage_2):
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("Distilled LoRA strengths must be between 0 and 1")
     for path in (args.checkpoint_path, args.distilled_lora_path, args.spatial_upsampler_path, args.gemma_root):
         if not path.exists() and not args.dry_run:
             raise FileNotFoundError(path)
-    return start, end
+
+
+def acquire_shard_lock(output_dir: Path, shard_index: int) -> TextIO:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / f".{SCRIPT_NAME}.shard_{shard_index}.lock"
+    handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(f"Shard {shard_index} is already running for {output_dir}") from None
+    handle.write(f"pid={os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def build_pipeline(args: argparse.Namespace) -> TI2VidTwoStagesHQPipeline:
+    checkpoint_path = str(args.checkpoint_path.resolve())
+    distilled_lora = [
+        LoraPathStrengthAndSDOps(
+            path=str(args.distilled_lora_path.resolve()),
+            strength=1.0,
+            sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+        )
+    ]
+    quantization = (
+        QuantizationKind(args.quantization).to_policy(checkpoint_path) if args.quantization != "none" else None
+    )
+    return TI2VidTwoStagesHQPipeline(
+        checkpoint_path=checkpoint_path,
+        distilled_lora=distilled_lora,
+        distilled_lora_strength_stage_1=args.distilled_lora_strength_stage_1,
+        distilled_lora_strength_stage_2=args.distilled_lora_strength_stage_2,
+        spatial_upsampler_path=str(args.spatial_upsampler_path.resolve()),
+        gemma_root=str(args.gemma_root.resolve()),
+        loras=(),
+        quantization=quantization,
+        registry=None,
+        offload_mode=OffloadMode(args.offload),
+        alloc_trim_strategy=AllocatorTrimStrategy.TRIM,
+    )
 
 
 def main() -> None:
     args = parse_args()
     rows = load_rows(args.prompts_csv.resolve())
-    start, end = validate_args(args, len(rows))
+    indices = selected_indices(args, len(rows))
+    validate_args(args)
     output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = output_dir / "manifest.jsonl"
 
     print(
-        f"[{SCRIPT_NAME}] prompts={len(rows)} range=[{start}, {end}) "
-        f"frames={args.num_frames} size={args.width}x{args.height} fps={args.fps:g} audio=off"
+        f"[{SCRIPT_NAME}] HQ shard={args.shard_index}/{args.num_shards} prompts={len(indices)} "
+        f"frames={args.num_frames} size={args.width}x{args.height} fps={args.fps:g} "
+        f"steps={args.num_inference_steps}+3 audio=off",
+        flush=True,
     )
     if args.dry_run:
-        for index in range(start, min(end, start + 3)):
+        for index in indices[:5]:
             print(f"video_{index:03d}.mp4 <- {rows[index]['prompt']}")
         return
 
-    vae_queue = torch.multiprocessing.get_context("spawn").SimpleQueue()
-    controller = MGPUController(TI2VidTwoStagesRunner, num_gpus=2)
-    controller.start(
-        timeout=timedelta(minutes=45),
-        checkpoint_path=str(args.checkpoint_path.resolve()),
-        gemma_root=str(args.gemma_root.resolve()),
-        spatial_upsampler_path=str(args.spatial_upsampler_path.resolve()),
-        vae_queue=vae_queue,
-        distilled_lora_path=str(args.distilled_lora_path.resolve()),
-    )
+    lock_handle = acquire_shard_lock(output_dir, args.shard_index)
     try:
-        for index in range(start, end):
+        if not args.overwrite and all(is_complete(output_dir / f"video_{index:03d}.mp4") for index in indices):
+            print(f"[{SCRIPT_NAME}] shard {args.shard_index} is already complete; exiting", flush=True)
+            return
+
+        pipeline = build_pipeline(args)
+        manifest_path = output_dir / f"manifest.shard_{args.shard_index}.jsonl"
+        tiling_config = TilingConfig.default()
+        video_chunks = get_video_chunks_number(args.num_frames, tiling_config)
+        params = LTX_2_3_HQ_PARAMS
+
+        for index in indices:
             row = rows[index]
             output_path = output_dir / f"video_{index:03d}.mp4"
             if is_complete(output_path) and not args.overwrite:
-                print(f"[{index + 1:03d}/{len(rows)}] skip {output_path.name}")
+                print(f"[{index + 1:03d}/{len(rows)}] skip {output_path.name}", flush=True)
                 continue
 
             temp_path = output_dir / f".video_{index:03d}.partial.mp4"
@@ -139,28 +211,31 @@ def main() -> None:
             seed = args.seed_base + index
             print(f"[{index + 1:03d}/{len(rows)}] seed={seed} prompt={row['prompt']!r}", flush=True)
             started = time.monotonic()
-            stream = controller.stream(
-                output_path=str(temp_path),
-                prompt=row["prompt"],
-                negative_prompt=DEFAULT_NEGATIVE_PROMPT,
-                seed=seed,
-                height=args.height,
-                width=args.width,
-                num_frames=args.num_frames,
-                frame_rate=args.fps,
-                num_inference_steps=args.num_inference_steps,
-                video_guider_params=LTX_2_3_PARAMS.video_guider_params,
-                audio_guider_params=LTX_2_3_PARAMS.audio_guider_params,
-                include_audio=False,
-                images=[],
-            )
-            try:
-                for _ in stream:
-                    pass
-            finally:
-                stream.drain()
+            with torch.inference_mode():
+                video, _audio = pipeline(
+                    prompt=row["prompt"],
+                    negative_prompt=args.negative_prompt,
+                    seed=seed,
+                    height=args.height,
+                    width=args.width,
+                    num_frames=args.num_frames,
+                    frame_rate=args.fps,
+                    num_inference_steps=args.num_inference_steps,
+                    video_guider_params=params.video_guider_params,
+                    audio_guider_params=params.audio_guider_params,
+                    images=[],
+                    tiling_config=tiling_config,
+                    enhance_prompt=args.enhance_prompt,
+                )
+                encode_video(
+                    video=video,
+                    fps=int(args.fps),
+                    audio=None,
+                    output_path=str(temp_path),
+                    video_chunks_number=video_chunks,
+                )
             if not is_complete(temp_path):
-                raise RuntimeError(f"LTX did not create a valid file: {temp_path}")
+                raise RuntimeError(f"LTX HQ did not create a valid file: {temp_path}")
             temp_path.replace(output_path)
             elapsed = time.monotonic() - started
             append_manifest(
@@ -172,16 +247,23 @@ def main() -> None:
                     "output": output_path.name,
                     "seed": seed,
                     "elapsed_seconds": round(elapsed, 3),
+                    "pipeline": "TI2VidTwoStagesHQPipeline",
+                    "num_inference_steps": args.num_inference_steps,
+                    "stage_2_steps": 3,
+                    "distilled_lora_strength_stage_1": args.distilled_lora_strength_stage_1,
+                    "distilled_lora_strength_stage_2": args.distilled_lora_strength_stage_2,
                     "num_frames": args.num_frames,
                     "width": args.width,
                     "height": args.height,
                     "fps": args.fps,
                     "audio": False,
+                    "shard_index": args.shard_index,
+                    "num_shards": args.num_shards,
                 },
             )
             print(f"[{index + 1:03d}/{len(rows)}] saved {output_path.name} in {elapsed:.1f}s", flush=True)
     finally:
-        controller.shutdown()
+        lock_handle.close()
 
 
 if __name__ == "__main__":
