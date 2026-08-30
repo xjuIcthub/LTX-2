@@ -153,6 +153,7 @@ class TI2VidTwoStagesRunner(MGPURunner):
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
         audio_guider_params: MultiModalGuiderParams,
+        include_audio: bool = True,
         images: list | None = None,
     ) -> Iterator[str | None]:
         # The pipeline raises ValueError on invalid input (symmetric across ranks); the controller
@@ -178,7 +179,7 @@ class TI2VidTwoStagesRunner(MGPURunner):
         encode_video(
             video=video,
             fps=frame_rate,
-            audio=audio,
+            audio=audio if include_audio else None,
             output_path=output_path,
             video_chunks_number=get_video_chunks_number(num_frames, TilingConfig.default()),
         )
