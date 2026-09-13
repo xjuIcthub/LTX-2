@@ -8,6 +8,12 @@ with audio. Run with one visible GPU, for example::
 
     CUDA_VISIBLE_DEVICES=0 uv run python tasks/infer.py sep14
 
+For multi-GPU inference, use one process per visible GPU. The first workers
+receive round-robin groups of videos; the last worker scans every unfinished
+video and consumes the remainder as a fallback::
+
+    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python tasks/infer.py sep14 --num-processes 4
+
 Each top-level CSV writes to a same-name directory containing
 ``video_000.mp4``, ``video_001.mp4``, and so on. Existing files are skipped
 unless ``--overwrite`` is supplied.
@@ -15,18 +21,22 @@ unless ``--overwrite`` is supplied.
 
 from __future__ import annotations
 
-# ruff: noqa: T201, PLC0415, PLR0915 -- standalone long-running CLI with lazy model imports.
+# ruff: noqa: T201, PLC0415 -- standalone long-running CLI with lazy model imports.
 import argparse
 import dataclasses
 import hashlib
 import json
 import logging
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 try:
     from ._common import (
         REPO_ROOT,
+        PromptRecord,
         TaskFormatError,
         prompt_csv_files,
         read_prompt_csv,
@@ -36,6 +46,7 @@ try:
 except ImportError:  # pragma: no cover - supports ``python tasks/infer.py``
     from _common import (
         REPO_ROOT,
+        PromptRecord,
         TaskFormatError,
         prompt_csv_files,
         read_prompt_csv,
@@ -145,6 +156,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quantization", choices=("none", "fp8-cast"), default="none")
     parser.add_argument("--offload", choices=("none", "cpu"), default="none")
     parser.add_argument("--max-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=1,
+        help="Number of one-GPU worker processes; 0 uses every visible GPU",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        default=None,
+        help="Comma-separated GPU IDs to use (overrides CUDA_VISIBLE_DEVICES for worker selection)",
+    )
+    parser.add_argument("--max-retries", type=int, default=2, help="Attempts per video within one run")
+    parser.add_argument("--_worker-index", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-count", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_run-id", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -165,6 +191,10 @@ def _validate_inference_args(args: argparse.Namespace, task_dir: Path) -> None:
         raise ValueError("The default task profile requires export_frames / fps == 5 seconds")
     if args.num_inference_steps < 1 or args.max_batch_size < 1:
         raise ValueError("num-inference-steps and max-batch-size must be positive")
+    if args.num_processes < 0:
+        raise ValueError("num-processes must be non-negative; use 0 for all visible GPUs")
+    if args.max_retries < 1:
+        raise ValueError("max-retries must be positive")
     if not args.dry_run:
         for path in (args.checkpoint_path, args.distilled_lora_path, args.spatial_upsampler_path, args.gemma_root):
             if not path.exists():
@@ -233,10 +263,110 @@ def _build_pipeline(args: argparse.Namespace) -> object:
     return pipeline
 
 
+WorkItem = tuple[Path, int, PromptRecord]
+
+
+def _all_work_items(task_dir: Path) -> list[WorkItem]:
+    """Read every prompt once in deterministic CSV/row order."""
+    return [
+        (csv_path, index, record)
+        for csv_path in prompt_csv_files(task_dir)
+        for index, record in enumerate(read_prompt_csv(csv_path))
+    ]
+
+
+def _output_path(task_dir: Path, csv_path: Path, index: int) -> Path:
+    return task_dir / csv_path.stem / f"video_{index:03d}.mp4"
+
+
+def _video_lock_path(output_path: Path) -> Path:
+    return output_path.with_suffix(".lock")
+
+
+def _read_lock_state(handle: object) -> list[str]:
+    handle.seek(0)  # type: ignore[attr-defined]
+    return handle.read().strip().split()  # type: ignore[attr-defined]
+
+
+def _write_lock_state(handle: object, state: str) -> None:
+    handle.seek(0)  # type: ignore[attr-defined]
+    handle.truncate()  # type: ignore[attr-defined]
+    handle.write(state + "\n")  # type: ignore[attr-defined]
+    handle.flush()  # type: ignore[attr-defined]
+
+
+def _release_video_lock(handle: object) -> None:
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+    handle.close()  # type: ignore[attr-defined]
+
+
+def _acquire_video_lock(lock_path: Path) -> object | None:
+    """Try to claim one output path without leaving stale claims after a crash."""
+    import fcntl
+
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def _state_matches_run(lock_path: Path, run_id: str, terminal_states: set[str]) -> bool:
+    try:
+        state = lock_path.read_text(encoding="utf-8").strip().split()
+    except FileNotFoundError:
+        return False
+    return len(state) >= 2 and state[1] == run_id and state[0] in terminal_states
+
+
+def _claim_item_lock(
+    output_path: Path,
+    *,
+    overwrite: bool,
+    run_id: str,
+) -> object | None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _video_lock_path(output_path)
+    handle = _acquire_video_lock(lock_path)
+    if handle is None:
+        return None
+    state = _read_lock_state(handle)
+    if len(state) >= 2 and state[1] == run_id and state[0] in {"done", "exhausted"}:
+        _release_video_lock(handle)
+        return None
+    if output_path.is_file() and not overwrite:
+        _release_video_lock(handle)
+        return None
+    return handle
+
+
+def _record_item_failure(handle: object, run_id: str, max_retries: int) -> None:
+    state = _read_lock_state(handle)
+    attempts = 0
+    if len(state) >= 3 and state[0] == "failed" and state[1] == run_id:
+        try:
+            attempts = int(state[2])
+        except ValueError:
+            attempts = 0
+    attempts += 1
+    status = "exhausted" if attempts >= max_retries else "failed"
+    _write_lock_state(handle, f"{status} {run_id} {attempts}")
+
+
 def _append_manifest(path: Path, payload: dict[str, object]) -> None:
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        handle.flush()
+    import fcntl
+
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.flush()
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _validate_output(path: Path, args: argparse.Namespace) -> dict[str, object]:
@@ -266,6 +396,264 @@ def _validate_output(path: Path, args: argparse.Namespace) -> dict[str, object]:
     return result
 
 
+def _run_video_item(  # noqa: PLR0913 -- the per-video call needs the shared HQ runtime context.
+    *,
+    args: argparse.Namespace,
+    task_dir: Path,
+    item: WorkItem,
+    global_index: int,
+    pipeline: object,
+    tiling_config: object,
+    video_chunks: int,
+    params: object,
+    negative_prompt: str,
+    worker_index: int,
+    worker_count: int,
+    gpu_label: str,
+) -> None:
+    import torch
+
+    csv_path, index, record = item
+    output_path = _output_path(task_dir, csv_path, index)
+    temporary_path = output_path.with_name(f".video_{index:03d}.partial.mp4")
+    temporary_path.unlink(missing_ok=True)
+    seed = args.seed_base + global_index
+    print(
+        f"worker={worker_index}/{worker_count} gpu={gpu_label} run {csv_path.name}:{index} "
+        f"id={record.id!r} seed={seed}",
+        flush=True,
+    )
+    started = time.monotonic()
+    with torch.inference_mode():
+        video, audio = pipeline(
+            prompt=record.prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            frame_rate=args.fps,
+            num_inference_steps=args.num_inference_steps,
+            video_guider_params=params.video_guider_params,
+            audio_guider_params=params.audio_guider_params,
+            images=[],
+            tiling_config=tiling_config,
+            enhance_prompt=args.enhance_prompt,
+            max_batch_size=args.max_batch_size,
+        )
+        audio = _trim_audio(audio, 5)
+        from ltx_pipelines.utils.media_io import encode_video
+
+        encode_video(
+            video=_export_frames(video, args.export_frames),
+            fps=int(args.fps),
+            audio=audio,
+            output_path=str(temporary_path),
+            video_chunks_number=video_chunks,
+            crf=args.crf,
+            preset=args.preset,
+        )
+    validation = _validate_output(temporary_path, args)
+    temporary_path.replace(output_path)
+    elapsed = time.monotonic() - started
+    payload = {
+        "state": "complete",
+        "csv": csv_path.name,
+        "row_index": index,
+        "id": record.id,
+        "prompt": record.prompt,
+        "output": output_path.name,
+        "seed": seed,
+        "elapsed_seconds": round(elapsed, 3),
+        "pipeline": "TI2VidTwoStagesHQPipeline",
+        "num_inference_steps": args.num_inference_steps,
+        "stage_2_steps": 3,
+        "width": args.width,
+        "height": args.height,
+        "num_frames": args.num_frames,
+        "export_frames": args.export_frames,
+        "fps": args.fps,
+        "audio": True,
+        "quantization": args.quantization,
+        "offload": args.offload,
+        "persistent_weights": not args.reload_weights_each_video,
+        "worker_index": worker_index,
+        "worker_count": worker_count,
+        "gpu": gpu_label,
+        "validation": validation,
+        "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+    }
+    _append_manifest(output_path.parent / "manifest.jsonl", payload)
+    print(f"worker={worker_index}/{worker_count} saved {output_path} in {elapsed:.1f}s", flush=True)
+
+
+def _run_worker(
+    args: argparse.Namespace,
+    task_dir: Path,
+    items: list[WorkItem],
+    *,
+    worker_index: int,
+    worker_count: int,
+    run_id: str,
+) -> int:
+    import torch
+
+    visible_gpu_count = torch.cuda.device_count()
+    if visible_gpu_count != 1:
+        raise RuntimeError(
+            f"Worker {worker_index} expected exactly one visible GPU, found {visible_gpu_count}. "
+            "The parent must assign one CUDA device per process."
+        )
+
+    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+    from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, LTX_2_3_HQ_PARAMS
+
+    gpu_label = os.environ.get("LTX_TASK_GPU_LABEL", os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+    print(f"worker={worker_index}/{worker_count} gpu={gpu_label} loading HQ pipeline", flush=True)
+    pipeline = _build_pipeline(args)
+    tiling_config = TilingConfig.default()
+    video_chunks = get_video_chunks_number(args.num_frames, tiling_config)
+    params = LTX_2_3_HQ_PARAMS
+    negative_prompt = args.negative_prompt or DEFAULT_NEGATIVE_PROMPT
+    run_started = time.monotonic()
+    if worker_index == worker_count - 1:
+        # The final worker scans the complete queue and takes any remainder
+        # left by the round-robin assignments of the other workers.
+        candidate_items = list(enumerate(items))
+    else:
+        candidate_items = [
+            (global_index, item)
+            for global_index, item in enumerate(items)
+            if global_index % worker_count == worker_index
+        ]
+    while True:
+        pending_seen = False
+        claimed_this_round = False
+        for global_index, item in candidate_items:
+            csv_path, index, _record = item
+            output_path = _output_path(task_dir, csv_path, index)
+            lock_path = _video_lock_path(output_path)
+            if output_path.is_file() and not args.overwrite:
+                continue
+            if args.overwrite and _state_matches_run(lock_path, run_id, {"done", "exhausted"}):
+                continue
+            pending_seen = True
+            lock_handle = _claim_item_lock(output_path, overwrite=args.overwrite, run_id=run_id)
+            if lock_handle is None:
+                continue
+            claimed_this_round = True
+            try:
+                _run_video_item(
+                    args=args,
+                    task_dir=task_dir,
+                    item=item,
+                    global_index=global_index,
+                    pipeline=pipeline,
+                    tiling_config=tiling_config,
+                    video_chunks=video_chunks,
+                    params=params,
+                    negative_prompt=negative_prompt,
+                    worker_index=worker_index,
+                    worker_count=worker_count,
+                    gpu_label=gpu_label,
+                )
+                _write_lock_state(lock_handle, f"done {run_id}")
+            except Exception:
+                logging.exception(
+                    "worker=%s failed %s:%s; retrying up to %s times",
+                    worker_index,
+                    csv_path.name,
+                    index,
+                    args.max_retries,
+                )
+                _record_item_failure(lock_handle, run_id, args.max_retries)
+            finally:
+                _release_video_lock(lock_handle)
+        if not pending_seen:
+            break
+        if not claimed_this_round:
+            # Another worker currently owns the remaining files. Locks release
+            # automatically if that process crashes, so keep polling as a fallback.
+            time.sleep(1)
+    print(f"worker={worker_index}/{worker_count} complete in {time.monotonic() - run_started:.1f}s", flush=True)
+    return 0
+
+
+def _gpu_ids(args: argparse.Namespace) -> list[str]:
+    configured = args.gpu_ids if args.gpu_ids is not None else os.environ.get("CUDA_VISIBLE_DEVICES")
+    if configured is not None:
+        gpu_ids = [value.strip() for value in configured.split(",") if value.strip()]
+        if not gpu_ids or gpu_ids == ["-1"]:
+            raise RuntimeError("No CUDA devices are selected; set CUDA_VISIBLE_DEVICES or --gpu-ids")
+        return gpu_ids
+    import torch
+
+    count = torch.cuda.device_count()
+    if count < 1:
+        raise RuntimeError("No CUDA devices found")
+    return [str(index) for index in range(count)]
+
+
+def _run_multi_process(
+    args: argparse.Namespace,
+    task_dir: Path,
+    items: list[WorkItem],
+) -> int:
+    gpu_ids = _gpu_ids(args)
+    worker_count = len(gpu_ids) if args.num_processes == 0 else args.num_processes
+    if worker_count > len(gpu_ids):
+        raise ValueError(f"Requested {worker_count} processes but only {len(gpu_ids)} GPUs are visible: {gpu_ids}")
+    selected_gpu_ids = gpu_ids[:worker_count]
+    run_id = args._run_id or f"{time.time_ns()}-{os.getpid()}"
+    print(
+        f"Launching {worker_count} one-GPU workers over {len(items)} videos; "
+        f"last worker is the dynamic remainder fallback (run={run_id})",
+        flush=True,
+    )
+    script_path = str(Path(__file__).resolve())
+    child_args = [argument for argument in sys.argv[1:] if not argument.startswith("--_worker-")]
+    child_args = [argument for argument in child_args if not argument.startswith("--_run-id")]
+    processes: list[subprocess.Popen[bytes]] = []
+    for worker_index, gpu_id in enumerate(selected_gpu_ids):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu_id
+        env["LTX_TASK_GPU_LABEL"] = gpu_id
+        env["PYTHONUNBUFFERED"] = "1"
+        command = [
+            sys.executable,
+            script_path,
+            *child_args,
+            "--_worker-index",
+            str(worker_index),
+            "--_worker-count",
+            str(worker_count),
+            "--_run-id",
+            run_id,
+        ]
+        print(f"  worker={worker_index}/{worker_count} -> CUDA_VISIBLE_DEVICES={gpu_id}", flush=True)
+        processes.append(subprocess.Popen(command, env=env))
+    exit_codes = [process.wait() for process in processes]
+    print(f"Worker exit codes: {exit_codes}", flush=True)
+    final_report = validate_task_dir(task_dir, check_videos=True)
+    if not final_report.ok:
+        for error in final_report.errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    if args.overwrite:
+        unfinished = [
+            f"{csv_path.name}:{index}"
+            for csv_path, index, _record in items
+            if not _state_matches_run(_video_lock_path(_output_path(task_dir, csv_path, index)), run_id, {"done"})
+        ]
+        if unfinished:
+            print(
+                "ERROR: overwrite run did not complete every video: " + ", ".join(unfinished),
+                file=sys.stderr,
+            )
+            return 1
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     task_dir = resolve_task_dir(args.task)
@@ -275,118 +663,33 @@ def main() -> int:
         raise TaskFormatError("Task validation failed: " + " | ".join(report.errors))
 
     csv_files = prompt_csv_files(task_dir)
-    pending = [
-        (csv_path, index)
-        for csv_path in csv_files
-        for index, _record in enumerate(read_prompt_csv(csv_path))
-        if args.overwrite or not (task_dir / csv_path.stem / f"video_{index:03d}.mp4").is_file()
-    ]
-    print(
-        f"Task {task_dir.name}: csv={len(csv_files)} rows={report.row_count} pending={len(pending)} "
-        f"profile=HQ {args.width}x{args.height} {args.export_frames} frames @ {args.fps:g} fps "
-        f"steps={args.num_inference_steps}+3 audio=on"
-    )
-    if args.dry_run or not pending:
-        for csv_path in csv_files:
-            records = read_prompt_csv(csv_path)
-            output_dir = task_dir / csv_path.stem
-            print(f"  {csv_path.name}: {len(records)} prompts -> {output_dir.name}/video_000.mp4 ...")
-        return 0
-
-    import torch
-
-    if torch.cuda.device_count() != 1:
-        raise RuntimeError(
-            f"Expected exactly one visible GPU, found {torch.cuda.device_count()}. "
-            "Set CUDA_VISIBLE_DEVICES to one GPU before launching this task."
+    items = _all_work_items(task_dir)
+    pending = [item for item in items if args.overwrite or not _output_path(task_dir, item[0], item[1]).is_file()]
+    is_worker = args._worker_index is not None
+    if not is_worker:
+        print(
+            f"Task {task_dir.name}: csv={len(csv_files)} rows={report.row_count} pending={len(pending)} "
+            f"profile=HQ {args.width}x{args.height} {args.export_frames} frames @ {args.fps:g} fps "
+            f"steps={args.num_inference_steps}+3 audio=on workers={args.num_processes or 'auto'}"
         )
+        if args.dry_run or not pending:
+            for csv_path in csv_files:
+                records = read_prompt_csv(csv_path)
+                output_dir = task_dir / csv_path.stem
+                print(f"  {csv_path.name}: {len(records)} prompts -> {output_dir.name}/video_000.mp4 ...")
+            return 0 if args.dry_run else int(not validate_task_dir(task_dir, check_videos=True).ok)
+        return _run_multi_process(args, task_dir, items)
 
-    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
-    from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, LTX_2_3_HQ_PARAMS
-    from ltx_pipelines.utils.media_io import encode_video
-
-    pipeline = _build_pipeline(args)
-    tiling_config = TilingConfig.default()
-    video_chunks = get_video_chunks_number(args.num_frames, tiling_config)
-    params = LTX_2_3_HQ_PARAMS
-    negative_prompt = args.negative_prompt or DEFAULT_NEGATIVE_PROMPT
-    run_started = time.monotonic()
-    global_index = 0
-    for csv_path in csv_files:
-        records = read_prompt_csv(csv_path)
-        output_dir = task_dir / csv_path.stem
-        output_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path = output_dir / "manifest.jsonl"
-        for index, record in enumerate(records):
-            output_path = output_dir / f"video_{index:03d}.mp4"
-            if output_path.is_file() and not args.overwrite:
-                print(f"skip {csv_path.name}:{index} -> {output_path.name}")
-                global_index += 1
-                continue
-            temporary_path = output_dir / f".video_{index:03d}.partial.mp4"
-            temporary_path.unlink(missing_ok=True)
-            seed = args.seed_base + global_index
-            print(f"run {csv_path.name}:{index} id={record.id!r} seed={seed}")
-            started = time.monotonic()
-            with torch.inference_mode():
-                video, audio = pipeline(
-                    prompt=record.prompt,
-                    negative_prompt=negative_prompt,
-                    seed=seed,
-                    height=args.height,
-                    width=args.width,
-                    num_frames=args.num_frames,
-                    frame_rate=args.fps,
-                    num_inference_steps=args.num_inference_steps,
-                    video_guider_params=params.video_guider_params,
-                    audio_guider_params=params.audio_guider_params,
-                    images=[],
-                    tiling_config=tiling_config,
-                    enhance_prompt=args.enhance_prompt,
-                    max_batch_size=args.max_batch_size,
-                )
-                audio = _trim_audio(audio, 5)
-                encode_video(
-                    video=_export_frames(video, args.export_frames),
-                    fps=int(args.fps),
-                    audio=audio,
-                    output_path=str(temporary_path),
-                    video_chunks_number=video_chunks,
-                    crf=args.crf,
-                    preset=args.preset,
-                )
-            validation = _validate_output(temporary_path, args)
-            temporary_path.replace(output_path)
-            elapsed = time.monotonic() - started
-            payload = {
-                "state": "complete",
-                "csv": csv_path.name,
-                "row_index": index,
-                "id": record.id,
-                "prompt": record.prompt,
-                "output": output_path.name,
-                "seed": seed,
-                "elapsed_seconds": round(elapsed, 3),
-                "pipeline": "TI2VidTwoStagesHQPipeline",
-                "num_inference_steps": args.num_inference_steps,
-                "stage_2_steps": 3,
-                "width": args.width,
-                "height": args.height,
-                "num_frames": args.num_frames,
-                "export_frames": args.export_frames,
-                "fps": args.fps,
-                "audio": True,
-                "quantization": args.quantization,
-                "offload": args.offload,
-                "persistent_weights": not args.reload_weights_each_video,
-                "validation": validation,
-                "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
-            }
-            _append_manifest(manifest_path, payload)
-            print(f"saved {output_path} in {elapsed:.1f}s")
-            global_index += 1
-    print(f"Completed task {task_dir.name} in {time.monotonic() - run_started:.1f}s")
-    return 0
+    if args._worker_count is None or args._worker_index < 0 or args._worker_index >= args._worker_count:
+        raise ValueError("Internal worker index/count is invalid")
+    return _run_worker(
+        args,
+        task_dir,
+        items,
+        worker_index=args._worker_index,
+        worker_count=args._worker_count,
+        run_id=args._run_id or f"{time.time_ns()}-{os.getpid()}",
+    )
 
 
 if __name__ == "__main__":

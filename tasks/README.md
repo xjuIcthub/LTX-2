@@ -29,6 +29,14 @@ CUDA_VISIBLE_DEVICES=0 uv run python tasks/infer.py sep14
 
 任务会复用已完成的视频；需要重跑时加 `--overwrite`。模型权重、Gemma 和 LoRA 默认从仓库的 `models/` 读取，也可以用对应命令行参数覆盖。
 
+多卡使用多进程，每个进程只看到并使用一张卡。前面的进程按轮转分配视频，最后一个进程扫描全部未完成视频并领取剩余任务作为兜底；一条视频完成并校验后立即原子改名为最终的 `video_00x.mp4`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python tasks/infer.py sep14 --num-processes 4
+```
+
+`--num-processes 0` 表示使用 `CUDA_VISIBLE_DEVICES` 中的全部卡，也可以用 `--gpu-ids 0,2,3` 指定卡。单个视频失败时默认在同一轮最多重试两次（可用 `--max-retries` 调整）。
+
 上传到 Hugging Face 数据集仓库 `xjuIcthub/tasks`：
 
 ```bash

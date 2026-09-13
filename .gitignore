@@ -79,4 +79,5 @@ wandb/
 *.so
 
 # Generated task outputs and per-video manifests
-tasks/*/*/manifest.jsonl
+tasks/*/*/manifest.jsonl*
+tasks/*/*/video_*.lock
