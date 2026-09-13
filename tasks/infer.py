@@ -6,13 +6,13 @@ full BF16 LTX-2.3 dev weights, no quantization, the HQ Res2s sampler, 15 stage-1
 steps plus 3 stage-2 steps, 1920x1088 output, 24 fps, and a five-second MP4
 with audio. Run with one visible GPU, for example::
 
-    CUDA_VISIBLE_DEVICES=0 uv run python tasks/infer.py sep14
+    CUDA_VISIBLE_DEVICES=0 uv run --no-sync python tasks/infer.py sep14
 
 For multi-GPU inference, use one process per visible GPU. The first workers
 receive round-robin groups of videos; the last worker scans every unfinished
 video and consumes the remainder as a fallback::
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python tasks/infer.py sep14 --num-processes 4
+    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --no-sync python tasks/infer.py sep14 --num-processes 4
 
 Each top-level CSV writes to a same-name directory containing
 ``video_000.mp4``, ``video_001.mp4``, and so on. Existing files are skipped
@@ -375,7 +375,7 @@ def _validate_output(path: Path, args: argparse.Namespace) -> dict[str, object]:
     with av.open(str(path)) as container:
         video_stream = next(stream for stream in container.streams if stream.type == "video")
         audio_streams = sum(stream.type == "audio" for stream in container.streams)
-        decoded_frames = sum(1 for _ in container.decode(video=video_stream))
+        decoded_frames = sum(1 for _ in container.decode(video=video_stream.index))
         if video_stream.duration is None or video_stream.time_base is None:
             raise RuntimeError(f"Video stream has no duration: {path}")
         duration = float(video_stream.duration * video_stream.time_base)
