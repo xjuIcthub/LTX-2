@@ -77,3 +77,6 @@ wandb/
 
 # Binary files
 *.so
+
+# Generated task outputs and per-video manifests
+tasks/*/*/manifest.jsonl

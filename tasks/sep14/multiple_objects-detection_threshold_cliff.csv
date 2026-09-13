@@ -1,0 +1,7 @@
+id,prompt
+0,"A simple indoor scene with a large black cat and a large white dog standing clearly apart. Both animals are fully visible and easy to recognize. Static camera, plain background, bright lighting, minimal occlusion."
+1,"A simple indoor scene with a large black cat clearly visible and a smaller white dog standing farther in the background. Both animals remain visible throughout the video. Static camera, plain background, bright lighting, minimal occlusion."
+2,"A simple indoor scene with a large black cat clearly visible and a small white dog partially hidden behind a low box. Most of the dog remains visible and recognizable. Static camera, plain background, simple lighting."
+3,"A simple indoor scene with a large black cat clearly visible and a small white dog partially occluded by a chair. Only part of the dog is visible, but its body and head can still be recognized. Static camera, plain background."
+4,"A simple tabletop scene with a large red cube clearly visible and a smaller blue ball farther from the camera. Both objects remain visible throughout the video. Static camera, plain background, simple lighting."
+5,"A simple tabletop scene with a large red cube clearly visible and a small blue ball partially hidden behind a low object. The blue ball is still partly visible and recognizable. Static camera, plain background, minimal scene clutter."
